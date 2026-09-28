@@ -1,0 +1,23 @@
+{
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "tenant_id": "00000000-0000-0000-0000-000000000000",
+  "resource_group": "your-resource-group",
+  "account_name": "your-foundry-resource",
+  "endpoint": "https://your-foundry-resource.services.ai.azure.com",
+  "deployment": "mai-image",
+  "model": "MAI-Image-2.6",
+  "model_version": "2026-07-31",
+  "location": "your-region",
+  "sku": "GlobalStandard",
+  "capacity": 1,
+  "requests_per_minute": 1,
+  "verified_on": "",
+  "catalog_deprecation_date": "",
+  "deployments": {
+    "mai-image": {
+      "model": "MAI-Image-2.6",
+      "model_version": "2026-07-31"
+    }
+  },
+  "api_limits_verified_on": "2026-09-28"
+}

@@ -1,0 +1,23 @@
+{
+  "location": "swedencentral",
+  "kind": "AIServices",
+  "sku": {
+    "name": "S0"
+  },
+  "tags": {
+    "purpose": "agent-image-generation",
+    "owner": "your-name"
+  },
+  "properties": {
+    "customSubDomainName": "your-foundry-resource",
+    "allowProjectManagement": true,
+    "disableLocalAuth": true,
+    "publicNetworkAccess": "Enabled",
+    "networkAcls": {
+      "defaultAction": "Allow",
+      "bypass": "None",
+      "ipRules": [],
+      "virtualNetworkRules": []
+    }
+  }
+}

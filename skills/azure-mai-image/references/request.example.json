@@ -1,0 +1,8 @@
+{
+  "model": "mai-image",
+  "prompt": "An original editorial illustration of a small floating island with a cozy observatory, warm sunset light, rich blue sky, clean composition, no text or logos.",
+  "width": 1024,
+  "height": 1024,
+  "auto_aspect_ratio": false,
+  "web_grounding": false
+}
