@@ -27,14 +27,15 @@ CONFIG = {
 FAKE_TOKEN = "test-token-not-a-credential"
 
 
-def png(width=768, height=768):
+def png(width=768, height=768, alpha=False):
     def chunk(kind, content):
         return (
             struct.pack(">I", len(content)) + kind + content
             + struct.pack(">I", zlib.crc32(kind + content) & 0xFFFFFFFF)
         )
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    pixels = zlib.compress((b"\0" + b"\x20\x60\xa0" * width) * height)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0)
+    pixel = b"\x20\x60\xa0\x00" if alpha else b"\x20\x60\xa0"
+    pixels = zlib.compress((b"\0" + pixel * width) * height)
     return generate.PNG_SIGNATURE + chunk(b"IHDR", ihdr) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
 
 
@@ -88,13 +89,26 @@ class ImageTests(unittest.TestCase):
             output = Path(directory) / "wide.png"
             args = generate.parser().parse_args([
                 "--prompt", "A wide original landscape", "--output", str(output),
-                "--width", "2048", "--height", "1152",
+                "--width", "2048", "--height", "1152", "--deployment", "mai-image",
             ])
             with patch.object(generate, "get_token", return_value=FAKE_TOKEN):
                 with patch.object(generate, "post_image", return_value=response(png(2048, 1152))) as post:
                     summary = generate.generate(args)
-            self.assertEqual((post.call_args.args[1]["width"], post.call_args.args[1]["height"]), (2048, 1152))
-            self.assertEqual((summary["width"], summary["height"]), (2048, 1152))
+            payload = post.call_args.args[1]
+            self.assertEqual((payload["width"], payload["height"]), (2048, 1152))
+            self.assertEqual(payload["model"], "mai-image")
+            self.assertFalse(payload["web_grounding"])
+            self.assertFalse(payload["auto_aspect_ratio"])
+            self.assertNotIn("background", payload)
+            self.assertEqual((summary["width"], summary["height"], summary["model"]), (2048, 1152, "MAI-Image-2.6"))
+
+    def test_saved_mai_27_response_decodes_within_the_model_limit(self):
+        image = png(2048, 2048)
+        for model in (None, "MAI-Image-2.7"):
+            with self.subTest(model=model):
+                self.assertEqual(generate.decode_image(response(image), model, strict=False)[1:], (2048, 2048))
+        with self.assertRaisesRegex(generate.ImageError, "implausible"):
+            generate.decode_image(response(image), "MAI-Image-2.6", strict=False)
 
     def test_valid_png(self):
         image = png()
@@ -161,6 +175,16 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(opener.open.call_count, 2)
         self.assertEqual(opener.open.call_args.args[0].get_header("Authorization"), f"Bearer {FAKE_TOKEN}")
 
+    def test_429_advice_uses_the_configured_rate(self):
+        for config, advice in (({**CONFIG, "requests_per_minute": 10}, "allows 10 requests/minute"),
+                               (CONFIG, "rate limit was reached")):
+            opener = Mock()
+            opener.open.side_effect = http_error(429, {"Retry-After": "1"})
+            with self.subTest(advice=advice), \
+                 patch.object(generate.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(generate.ImageError, advice):
+                    generate.post_image(config, {}, FAKE_TOKEN, 10, 0)
+
     def test_long_retry_after_and_5xx_are_not_retried(self):
         for error in (
             http_error(429, {"Retry-After": "121"}),
@@ -211,10 +235,11 @@ class ImageTests(unittest.TestCase):
                 with patch.object(generate, "post_image", return_value=response()) as post:
                     summary = generate.generate(args)
             payload = post.call_args.args[1]
-            self.assertFalse(payload["web_grounding"])
-            self.assertFalse(payload["auto_aspect_ratio"])
-            self.assertEqual(payload["model"], "mai-image")
-            self.assertEqual(summary["model"], "MAI-Image-2.6")
+            # The installed default is the MAI-Image-2.7 deployment, which gets no 2.6-only fields.
+            self.assertEqual(payload["model"], "mai-image-27")
+            for field in ("web_grounding", "auto_aspect_ratio", "background"):
+                self.assertNotIn(field, payload)
+            self.assertEqual(summary["model"], "MAI-Image-2.7")
             self.assertNotIn(FAKE_TOKEN, json.dumps(summary))
 
     def test_failed_requests_leave_no_output_or_temporary_files(self):

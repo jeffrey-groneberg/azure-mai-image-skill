@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate or edit one MAI image using an in-memory Azure CLI access token.
 
-Also computes the largest valid size for an aspect ratio and can write a clearly labelled,
-interpolated upscale (for example 4K for full-bleed slides) from a generated or existing image."""
+Also computes the largest valid size for an aspect ratio, can request a transparent background on
+MAI-Image-2.7, and can write a clearly labelled, interpolated upscale (for example 4K for full-bleed
+slides) from a generated or existing image."""
 
 import argparse
 import base64
@@ -30,18 +31,24 @@ import zlib
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 TOKEN_RESOURCE = "https://cognitiveservices.azure.com"
-MAX_PIXELS = 1_048_576
+MAX_PIXELS = 1_048_576  # MAI-Image-2.5 models, e.g. 1360x768
 MAX_PIXELS_MAI_26 = 2_359_296  # documented limit for MAI-Image-2.6 models, e.g. 2048x1152
-# Documented maximum total pixels per image (Microsoft Learn, "Deploy and use MAI image models", 2026-09-28).
-# The service enforces it: 3840x2160 returns HTTP 400 "exceeds the maximum of 2359296".
+MAX_PIXELS_MAI_27 = 4_194_304  # MAI-Image-2.7 models, e.g. 2048x2048 or 2704x1520
+# Maximum total pixels per image. 2.6 and 2.5 are documented (Microsoft Learn, "Deploy and use MAI image
+# models", 2026-09-28) and enforced: 3840x2160 on 2.6 returns HTTP 400 "exceeds the maximum of 2359296".
+# 2.7 is not documented yet; on 2026-11-26 the 2.7 deployment rejected 16384x16384 with HTTP 400
+# "exceeds the maximum of 4194304". 2.7-Flash is assumed to match (same capabilities per Learn; not probed).
 MODEL_PIXEL_LIMITS = {
+    "MAI-Image-2.7": MAX_PIXELS_MAI_27,
+    "MAI-Image-2.7-Flash": MAX_PIXELS_MAI_27,
     "MAI-Image-2.6": MAX_PIXELS_MAI_26,
     "MAI-Image-2.6-Flash": MAX_PIXELS_MAI_26,
     "MAI-Image-2.5-Pro": MAX_PIXELS,
     "MAI-Image-2.5-Flash": MAX_PIXELS,
     "MAI-Image-2.5": MAX_PIXELS,
 }
-MIN_SIDE = 768
+FAMILY_PIXEL_LIMITS = (("MAI-Image-2.7", MAX_PIXELS_MAI_27), ("MAI-Image-2.6", MAX_PIXELS_MAI_26))
+MIN_SIDE = 768  # documented; 2.7 also reports "'width' (or 'height') must be at least 768 pixels"
 SIZE_STEP = 16  # sizes computed by --aspect are multiples of 16 pixels
 MAX_UPSCALE_PIXELS = 7680 * 4320
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -128,7 +135,19 @@ def select_deployment(config: dict, name: str | None = None) -> dict:
     model = entry.get("model") if isinstance(entry, dict) else None
     if not isinstance(model, str) or not model.startswith("MAI-Image-"):
         raise ImageError(f"Deployment {name!r} needs a MAI image 'model' in config.json.")
-    return {**config, "deployment": name, "model": model, "model_version": entry.get("model_version", "")}
+    # The top-level rate describes the default deployment only.
+    rpm = entry.get("requests_per_minute",
+                    config.get("requests_per_minute") if name == config["deployment"] else None)
+    return {**config, "deployment": name, "model": model, "model_version": entry.get("model_version", ""),
+            "requests_per_minute": rpm}
+
+
+def suggest_deployment(config: dict, supported) -> str:
+    """' Use --deployment NAME.' for a configured deployment whose model supports an option, else ''."""
+    for name, entry in sorted((config.get("deployments") or {}).items()):
+        if isinstance(entry, dict) and supported(entry.get("model")):
+            return f" Use --deployment {name}."
+    return ""
 
 
 def image_size(data: bytes) -> tuple[int, int]:
@@ -252,15 +271,29 @@ def get_token(config: dict) -> str:
     return token
 
 
+def in_family(model: str | None, family: str) -> bool:
+    """True for the model itself and its variants, e.g. MAI-Image-2.7 and MAI-Image-2.7-Flash."""
+    return model == family or (model or "").startswith(family + "-")
+
+
 def pixel_limit(model: str | None) -> int:
+    """Total-pixel limit of a model; unlisted 2.7/2.6 variants use their family's, anything else 2.5's."""
     if model in MODEL_PIXEL_LIMITS:
         return MODEL_PIXEL_LIMITS[model]
-    return MAX_PIXELS_MAI_26 if (model or "").startswith("MAI-Image-2.6") else MAX_PIXELS
+    for family, limit in FAMILY_PIXEL_LIMITS:
+        if in_family(model, family):
+            return limit
+    return MAX_PIXELS
 
 
 def supports_26_options(model: str | None) -> bool:
-    """auto_aspect_ratio and web_grounding exist only on MAI-Image-2.6 and MAI-Image-2.6-Flash."""
-    return (model or "").startswith("MAI-Image-2.6")
+    """auto_aspect_ratio and web_grounding are documented only for MAI-Image-2.6 and 2.6-Flash, not 2.7."""
+    return in_family(model, "MAI-Image-2.6")
+
+
+def supports_transparent_background(model: str | None) -> bool:
+    """background=transparent is documented only for MAI-Image-2.7 models (Learn generation example)."""
+    return in_family(model, "MAI-Image-2.7")
 
 
 def parse_aspect(text: str) -> float:
@@ -295,12 +328,11 @@ def largest_size(aspect: float, model: str | None = None, step: int = SIZE_STEP,
 def validate_dimensions(width: int, height: int, model: str | None = None) -> None:
     limit = pixel_limit(model)
     if width < MIN_SIDE or height < MIN_SIDE or width * height > limit:
-        sizes = "1024x1024, 1344x768, or 768x1344"
-        if limit > MAX_PIXELS:
-            sizes = "1024x1024, 1344x768, 768x1344, 2048x1152, or 1152x2048"
+        sizes = ", ".join("{}x{}".format(*largest_size(ratio, model)) for ratio in (16 / 9, 1.0, 9 / 16))
+        where = f" on {model}" if model else ""
         raise ImageError(
-            "Width and height must each be at least 768; their product must be "
-            f"at most {limit:,}. Use {sizes}."
+            f"Width and height must each be at least {MIN_SIDE}; their product must be "
+            f"at most {limit:,}{where}. Largest 16:9, 1:1 and 9:16 sizes: {sizes}; or use --aspect."
         )
 
 
@@ -427,11 +459,14 @@ def post_image(
                     )
                     time.sleep(delay)
                     continue
+                rpm = config.get("requests_per_minute")
                 advice = {
                     401: "Check your Azure sign-in, token audience, and inference RBAC.",
                     403: "Check inference RBAC and network policy. Do not enable API keys.",
                     404: "Check the configured endpoint, deployment, and model retirement.",
-                    429: "The deployment allows 1 request/minute; retry later.",
+                    429: (f"The deployment allows {rpm:g} requests/minute, shared by every caller; retry later."
+                          if isinstance(rpm, (int, float)) and not isinstance(rpm, bool) and rpm > 0
+                          else "The deployment's rate limit was reached; retry later."),
                 }.get(exc.code, "Request was not retried automatically.")
                 raise ImageError(f"{message}\n{advice}") from exc
             finally:
@@ -469,9 +504,25 @@ def decode_image(result: dict, model: str | None = None, strict: bool = True) ->
     width, height = struct.unpack(">II", image[16:24])
     if strict:
         validate_dimensions(width, height, model)
-    elif not (0 < width and 0 < height and width * height <= pixel_limit("MAI-Image-2.6")):
+    elif not (0 < width and 0 < height and width * height <= (
+            pixel_limit(model) if model else max(MODEL_PIXEL_LIMITS.values()))):
         raise ImageError(f"Response image has implausible dimensions {width}x{height}; no file was saved.")
     return image, width, height
+
+
+def png_has_alpha(image: bytes) -> bool:
+    """True if a validated PNG has an alpha channel (color type 4 or 6) or a tRNS chunk."""
+    if image[25] in (4, 6):
+        return True
+    index = 8
+    while index + 8 <= len(image):
+        length, kind = struct.unpack(">I4s", image[index:index + 8])
+        if kind == b"tRNS":
+            return True
+        if kind in (b"IDAT", b"IEND"):
+            return False
+        index += 12 + length
+    return False
 
 
 def parser() -> argparse.ArgumentParser:
@@ -489,13 +540,20 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--width", type=int, help="Generation width; default 1024. Not an edit parameter.")
     cli.add_argument("--height", type=int, help="Generation height; default 1024. Not an edit parameter.")
     cli.add_argument("--aspect", help="Generation only: largest valid size for this aspect ratio, e.g. 16:9 "
-                                      "(2048x1152 on MAI-Image-2.6). Cannot combine with --width/--height.")
+                                      "(2704x1520 on MAI-Image-2.7, 2048x1152 on MAI-Image-2.6). "
+                                      "Cannot combine with --width/--height.")
     cli.add_argument("--upscale", help="Also write an interpolated upscale: 4k, 8k, a factor such as 2x, or WxH. "
                                        "Saved as <output>-<spec>.png; no new detail is created.")
     cli.add_argument("--deployment", help="Configured deployment name (config.json 'deployments'); "
-                                          "default: the configured deployment.")
-    cli.add_argument("--auto-aspect-ratio", action="store_true", help="Let MAI 2.6 choose framing.")
-    cli.add_argument("--web-grounding", action="store_true", help="Opt in to Bing-grounded generation.")
+                                          "default: the configured deployment. Its model sets the size "
+                                          "limit and model-specific options.")
+    cli.add_argument("--transparent-background", action="store_true",
+                     help="MAI-Image-2.7 models, generation only: request a transparent background "
+                          "(PNG with alpha) for logos, icons and cut-out assets.")
+    cli.add_argument("--auto-aspect-ratio", action="store_true",
+                     help="MAI-Image-2.6 models only: let the model choose framing.")
+    cli.add_argument("--web-grounding", action="store_true",
+                     help="MAI-Image-2.6 models only: opt in to Bing-grounded generation.")
     cli.add_argument("--timeout", type=float, default=300, help="Network I/O timeout in seconds (1-600).")
     cli.add_argument("--retries", type=int, choices=(0, 1, 2), default=1, help="Retries of HTTP 429 only.")
     return cli
@@ -505,7 +563,8 @@ def upscale_only(args: argparse.Namespace) -> dict:
     """Interpolated upscale of an existing PNG/JPEG; no Azure call and no token."""
     extras = [args.input_image, args.width, args.height, getattr(args, "aspect", None),
               getattr(args, "deployment", None)]
-    if any(value not in (None, []) for value in extras) or args.auto_aspect_ratio or args.web_grounding:
+    if (any(value not in (None, []) for value in extras) or args.auto_aspect_ratio or args.web_grounding
+            or getattr(args, "transparent_background", False)):
         raise ImageError("--upscale-from accepts only --upscale and --output.")
     if not getattr(args, "upscale", None):
         raise ImageError("--upscale-from needs --upscale, for example 4k.")
@@ -533,6 +592,7 @@ def generate(args: argparse.Namespace) -> dict:
     aspect = getattr(args, "aspect", None)
     upscale = getattr(args, "upscale", None)
     deployment = getattr(args, "deployment", None)
+    transparent = getattr(args, "transparent_background", False)
     if not 1 <= args.timeout <= 600:
         raise ImageError("Timeout must be between 1 and 600 seconds.")
     if inputs and args.response_json is not None:
@@ -541,10 +601,14 @@ def generate(args: argparse.Namespace) -> dict:
         raise ImageError("The MAI edits API does not accept width/height; omit those options.")
     if inputs and aspect is not None:
         raise ImageError("The MAI edits API does not accept a size; --aspect is for generation only.")
+    if inputs and transparent:
+        raise ImageError("--transparent-background is for generation only; the MAI edits API documents "
+                         "no background parameter.")
     if aspect is not None and (args.width is not None or args.height is not None):
         raise ImageError("Use either --aspect or --width/--height, not both.")
-    if args.response_json is not None and (aspect is not None or deployment is not None):
-        raise ImageError("--response-json decodes a saved response; --aspect and --deployment do not apply.")
+    if args.response_json is not None and (aspect is not None or deployment is not None or transparent):
+        raise ImageError("--response-json decodes a saved response; --aspect, --deployment and "
+                         "--transparent-background do not apply.")
     if len(inputs) > MAX_REFERENCES:
         raise ImageError(f"Pass at most five --input-image files; the MAI edits API accepts up to {MAX_REFERENCES}.")
     width = args.width if args.width is not None else 1024
@@ -570,7 +634,15 @@ def generate(args: argparse.Namespace) -> dict:
         config = select_deployment(load_config(), deployment)
         model = config["model"]
         if (args.auto_aspect_ratio or args.web_grounding) and not supports_26_options(model):
-            raise ImageError("--auto-aspect-ratio and --web-grounding apply only to MAI-Image-2.6 models.")
+            raise ImageError(
+                "--auto-aspect-ratio and --web-grounding apply only to MAI-Image-2.6 models; deployment "
+                f"{config['deployment']!r} runs {model}.{suggest_deployment(config, supports_26_options)}"
+            )
+        if transparent and not supports_transparent_background(model):
+            raise ImageError(
+                "--transparent-background applies only to MAI-Image-2.7 models; deployment "
+                f"{config['deployment']!r} runs {model}.{suggest_deployment(config, supports_transparent_background)}"
+            )
         if aspect is not None:
             width, height = largest_size(parse_aspect(aspect), model)
         if not inputs:
@@ -582,6 +654,8 @@ def generate(args: argparse.Namespace) -> dict:
             payload.update(auto_aspect_ratio=args.auto_aspect_ratio, web_grounding=args.web_grounding)
         if not inputs:
             payload.update(width=width, height=height)
+            if transparent:
+                payload["background"] = "transparent"
         else:
             loaded = [read_reference(path) for path in inputs]
             reference = loaded[0] if len(loaded) == 1 else loaded
@@ -594,9 +668,9 @@ def generate(args: argparse.Namespace) -> dict:
         else:
             token = get_token(config)
             result = post_image(config, payload, token, args.timeout, args.retries, reference)
-        # Edits and model-chosen framing may return other sizes (edits: about 1 MP at the input's aspect).
+        # Edits and model-chosen framing may return other sizes (2.6 edits: about 1 MP at the input's aspect).
         image, actual_width, actual_height = decode_image(
-            result, config["model"] if config is not None else "MAI-Image-2.6", strict=exact_size,
+            result, config["model"] if config is not None else None, strict=exact_size,
         )
         if exact_size and (actual_width, actual_height) != (width, height):
             raise ImageError("PNG dimensions do not match the requested dimensions.")
@@ -613,6 +687,8 @@ def generate(args: argparse.Namespace) -> dict:
     if config is not None:
         summary.update(deployment=config["deployment"], model=config["model"])
         summary["operation"] = "edit" if reference is not None else "generate"
+        if transparent:
+            summary.update(background="transparent", alpha=png_has_alpha(image))
         if reference is not None:
             hashes = [hashlib.sha256(image).hexdigest()
                       for image, _ in ([reference] if isinstance(reference, tuple) else reference)]

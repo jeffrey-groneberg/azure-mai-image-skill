@@ -123,6 +123,14 @@ class EditTests(unittest.TestCase):
         with self.assertRaisesRegex(mai.ImageError, "does not accept width/height"):
             mai.generate(self.arguments("--input-image", str(self.reference), "--width", "1344"))
 
+    def test_transparent_background_rejected_for_edits(self):
+        self.config.update(model="MAI-Image-2.7")
+        with patch.object(mai, "load_config", return_value=self.config), \
+             patch.object(mai, "get_token") as token:
+            with self.assertRaisesRegex(mai.ImageError, "generation only"):
+                mai.generate(self.arguments("--input-image", str(self.reference), "--transparent-background"))
+        token.assert_not_called()
+
     def test_saved_response_cannot_edit(self):
         args = mai.parser().parse_args([
             "--response-json", str(self.root / "response.json"),

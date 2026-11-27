@@ -4,20 +4,32 @@
   "resource_group": "your-resource-group",
   "account_name": "your-foundry-resource",
   "endpoint": "https://your-foundry-resource.services.ai.azure.com",
-  "deployment": "mai-image",
-  "model": "MAI-Image-2.6",
-  "model_version": "2026-07-31",
+  "deployment": "mai-image-27",
+  "model": "MAI-Image-2.7",
+  "model_version": "2026-11-02",
   "location": "your-region",
   "sku": "GlobalStandard",
-  "capacity": 1,
-  "requests_per_minute": 1,
+  "capacity": 10,
+  "requests_per_minute": 10,
   "verified_on": "",
-  "catalog_deprecation_date": "",
+  "catalog_deprecation_date": "2027-02-17",
   "deployments": {
+    "mai-image-27": {
+      "model": "MAI-Image-2.7",
+      "model_version": "2026-11-02",
+      "lifecycle_status": "Preview",
+      "capacity": 10,
+      "requests_per_minute": 10,
+      "catalog_deprecation_date": "2027-02-17"
+    },
     "mai-image": {
       "model": "MAI-Image-2.6",
-      "model_version": "2026-07-31"
+      "model_version": "2026-07-31",
+      "lifecycle_status": "GenerallyAvailable",
+      "capacity": 10,
+      "requests_per_minute": 10,
+      "catalog_deprecation_date": "2027-05-01"
     }
   },
-  "api_limits_verified_on": "2026-09-28"
+  "api_limits_verified_on": "2026-11-27"
 }

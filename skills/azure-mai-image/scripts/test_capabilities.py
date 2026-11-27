@@ -36,6 +36,7 @@ class CapabilityTests(unittest.TestCase):
             "deployments": {
                 "mai-image": {"model": "MAI-Image-2.6", "model_version": "2026-07-31"},
                 "mai-image-25": {"model": "MAI-Image-2.5", "model_version": "2026-06-02"},
+                "mai-image-27": {"model": "MAI-Image-2.7", "model_version": "2026-11-02"},
             },
         }
 
@@ -53,13 +54,25 @@ class CapabilityTests(unittest.TestCase):
             return mai.generate(args), post
 
     # --- limits and sizes -------------------------------------------------------------
-    def test_documented_pixel_limit_for_every_listed_model(self):
+    def test_pixel_limits_and_model_options(self):
+        # 2.7's limit is the one the service reported on 2026-11-26; unlisted 2.7 variants share it.
+        for model in ("MAI-Image-2.7", "MAI-Image-2.7-Flash", "MAI-Image-2.7-Preview"):
+            self.assertEqual(mai.pixel_limit(model), 4_194_304)
+            self.assertTrue(mai.supports_transparent_background(model))
+            self.assertFalse(mai.supports_26_options(model))
         for model in ("MAI-Image-2.6", "MAI-Image-2.6-Flash"):
             self.assertEqual(mai.pixel_limit(model), 2_359_296)
             self.assertTrue(mai.supports_26_options(model))
+            self.assertFalse(mai.supports_transparent_background(model))
         for model in ("MAI-Image-2.5", "MAI-Image-2.5-Flash", "MAI-Image-2.5-Pro"):
             self.assertEqual(mai.pixel_limit(model), 1_048_576)
             self.assertFalse(mai.supports_26_options(model))
+            self.assertFalse(mai.supports_transparent_background(model))
+        for width, height in ((2048, 2048), (2704, 1520), (4096, 1024)):
+            mai.validate_dimensions(width, height, "MAI-Image-2.7")
+        with self.assertRaisesRegex(mai.ImageError, r"4,194,304 on MAI-Image-2\.7\. Largest 16:9, 1:1 and 9:16 "
+                                                    r"sizes: 2704x1520, 2048x2048, 1536x2720"):
+            mai.validate_dimensions(2048, 2049, "MAI-Image-2.7")
 
     def test_native_4k_is_outside_every_documented_limit(self):
         for model in mai.MODEL_PIXEL_LIMITS:
@@ -70,15 +83,20 @@ class CapabilityTests(unittest.TestCase):
         expected = {"16:9": (2048, 1152), "9:16": (1152, 2048), "1:1": (1536, 1536)}
         for aspect, size in expected.items():
             self.assertEqual(mai.largest_size(mai.parse_aspect(aspect), "MAI-Image-2.6"), size)
+        expected_27 = {"16:9": (2704, 1520), "9:16": (1536, 2720), "1:1": (2048, 2048), "4:1": (4096, 1024)}
+        for aspect, size in expected_27.items():
+            self.assertEqual(mai.largest_size(mai.parse_aspect(aspect), "MAI-Image-2.7"), size)
         self.assertEqual(mai.largest_size(mai.parse_aspect("16:9"), "MAI-Image-2.5"), (1360, 768))
         self.assertEqual(mai.largest_size(mai.parse_aspect("1:1"), "MAI-Image-2.5"), (1024, 1024))
-        for aspect in ("2:1", "3:2", "4:3", "21:9", "2.39:1", "4:1", "3:4"):
-            width, height = mai.largest_size(mai.parse_aspect(aspect), "MAI-Image-2.6")
-            with self.subTest(aspect=aspect, size=(width, height)):
-                mai.validate_dimensions(width, height, "MAI-Image-2.6")
-                self.assertEqual((width % 16, height % 16), (0, 0))
-                self.assertLessEqual(abs(width / height - mai.parse_aspect(aspect)) / mai.parse_aspect(aspect), 0.01)
-                self.assertGreater(width * height, 0.97 * 2_359_296)
+        for model in ("MAI-Image-2.7", "MAI-Image-2.6"):
+            for aspect in ("2:1", "3:2", "4:3", "21:9", "2.39:1", "4:1", "3:4"):
+                width, height = mai.largest_size(mai.parse_aspect(aspect), model)
+                with self.subTest(model=model, aspect=aspect, size=(width, height)):
+                    mai.validate_dimensions(width, height, model)
+                    self.assertEqual((width % 16, height % 16), (0, 0))
+                    ratio = mai.parse_aspect(aspect)
+                    self.assertLessEqual(abs(width / height - ratio) / ratio, 0.01)
+                    self.assertGreater(width * height, 0.97 * mai.pixel_limit(model))
 
     def test_impossible_aspects_and_bad_syntax(self):
         with self.assertRaises(mai.ImageError):
@@ -118,6 +136,7 @@ class CapabilityTests(unittest.TestCase):
     def test_26_only_flags_and_unknown_deployments_fail_before_token(self):
         for extra in (("--deployment", "mai-image-25", "--web-grounding"),
                       ("--deployment", "mai-image-25", "--auto-aspect-ratio"),
+                      ("--deployment", "mai-image-27", "--web-grounding"),
                       ("--deployment", "not-configured")):
             with self.subTest(extra=extra), \
                  patch.object(mai, "load_config", return_value=self.config), \
@@ -125,6 +144,48 @@ class CapabilityTests(unittest.TestCase):
                 with self.assertRaises(mai.ImageError):
                     mai.generate(self.arguments(*extra))
                 token.assert_not_called()
+
+    def test_transparent_background_is_sent_only_on_mai_27_generations(self):
+        summary, post = self.run_generate(
+            self.arguments("--deployment", "mai-image-27", "--aspect", "1:1", "--transparent-background"),
+            png(2048, 2048, alpha=True))
+        payload = post.call_args.args[1]
+        self.assertEqual(payload["background"], "transparent")
+        self.assertEqual((payload["width"], payload["height"]), (2048, 2048))
+        self.assertNotIn("auto_aspect_ratio", payload)
+        self.assertNotIn("web_grounding", payload)
+        self.assertEqual((summary["model"], summary["background"], summary["alpha"]),
+                         ("MAI-Image-2.7", "transparent", True))
+        _, post = self.run_generate(self.arguments("--deployment", "mai-image-27", output="opaque.png"),
+                                    png(1024, 1024))
+        self.assertNotIn("background", post.call_args.args[1])
+
+    def test_png_alpha_detection(self):
+        opaque = png(768, 768)
+        trns = b"\0" * 6
+        chunk = struct.pack(">I", len(trns)) + b"tRNS" + trns + struct.pack(">I", mai.zlib.crc32(b"tRNS" + trns))
+        self.assertFalse(mai.png_has_alpha(opaque))
+        self.assertTrue(mai.png_has_alpha(png(768, 768, alpha=True)))
+        self.assertTrue(mai.png_has_alpha(opaque[:33] + chunk + opaque[33:]))
+
+    def test_transparent_background_is_rejected_before_token(self):
+        cases = (
+            (("--transparent-background",), "runs MAI-Image-2.6. Use --deployment mai-image-27"),
+            (("--deployment", "mai-image-25", "--transparent-background"), "only to MAI-Image-2.7"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra), \
+                 patch.object(mai, "load_config", return_value=self.config), \
+                 patch.object(mai, "get_token") as token:
+                with self.assertRaisesRegex(mai.ImageError, message):
+                    mai.generate(self.arguments(*extra))
+                token.assert_not_called()
+        saved = mai.parser().parse_args(["--response-json", str(self.root / "saved.json"),
+                                         "--transparent-background", "--output", str(self.root / "x.png")])
+        with patch.object(mai, "get_token") as token:
+            with self.assertRaisesRegex(mai.ImageError, "do not apply"):
+                mai.generate(saved)
+            token.assert_not_called()
 
     # --- edits ---------------------------------------------------------------------------
     def test_edit_results_with_a_side_below_768_are_kept(self):
@@ -199,7 +260,8 @@ class CapabilityTests(unittest.TestCase):
     def test_upscale_existing_rejects_generation_options(self):
         source = self.root / "native.png"
         source.write_bytes(png(1024, 576))
-        for extra in (("--width", "2048"), ("--aspect", "16:9"), ("--web-grounding",), ()):
+        for extra in (("--width", "2048"), ("--aspect", "16:9"), ("--web-grounding",),
+                      ("--transparent-background",), ()):
             args = mai.parser().parse_args(["--upscale-from", str(source), "--output", str(self.root / "x.png"),
                                             *(("--upscale", "4k") if extra else ()), *extra])
             with self.subTest(extra=extra), self.assertRaises(mai.ImageError):
